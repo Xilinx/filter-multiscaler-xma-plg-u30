@@ -687,11 +687,14 @@ multi_scaler_allocate_buffers (XmaScalerSession *session)
   return XMA_SUCCESS;
 cleanup:
   for (output_id = 0; output_id < max_outputs; output_id++) {
-    for (plane_id = 0; plane_id < get_num_video_planes(session->props.output[output_id].format); plane_id++) {
-      if (ctx->out_phandle[output_id][plane_id]) {
-          xvbm_buffer_pool_destroy(ctx->out_phandle[output_id][plane_id]);
-      }
-    }/* plane_id */
+    //@TODO add and use pool sharing API in xvbm
+    if (!ctx->session_mix_rate) {
+      for (plane_id = 0; plane_id < get_num_video_planes(session->props.output[output_id].format); plane_id++) {
+        if (ctx->out_phandle[output_id][plane_id]) {
+            xvbm_buffer_pool_destroy(ctx->out_phandle[output_id][plane_id]);
+        }
+      }/* plane_id */
+    }
 
     if(ctx->HfltCoeff_Buffer[output_id].data) {
       xma_plg_buffer_free(xma_session, ctx->HfltCoeff_Buffer[output_id]);
@@ -1549,12 +1552,14 @@ xlnx_multi_scaler_close(XmaScalerSession *session)
     xma_plg_buffer_free(xma_session, ctx->HfltCoeff_Buffer[output_id]);
     xma_plg_buffer_free(xma_session, ctx->VfltCoeff_Buffer[output_id]);
     xma_plg_buffer_free(xma_session, ctx->desc_buffer[output_id]);
-
-    for (plane_id = 0; plane_id < get_num_video_planes(session->props.output[output_id].format); plane_id++) {
-        if (ctx->out_phandle[output_id][plane_id]) {
-            xvbm_buffer_pool_destroy(ctx->out_phandle[output_id][plane_id]);
-        }
-    }/* plane_id */
+    //@TODO add and use pool sharing API in xvbm
+    if (!ctx->session_mix_rate) {
+        for (plane_id = 0; plane_id < get_num_video_planes(session->props.output[output_id].format); plane_id++) {
+            if (ctx->out_phandle[output_id][plane_id]) {
+                xvbm_buffer_pool_destroy(ctx->out_phandle[output_id][plane_id]);
+            }
+        }/* plane_id */
+    }
   }/* output_id */
 
   if(ctx->desc)

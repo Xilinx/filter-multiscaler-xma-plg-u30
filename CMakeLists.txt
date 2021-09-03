@@ -80,7 +80,7 @@ install(TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_PREFIX}/xma_plugins)
 
 # Packaging section
 set(CPACK_PACKAGE_NAME "${PROJECT_NAME}")
-set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_VERSION "1.0.1")
 set(CPACK_PACKAGE_CONTACT "Rohit Athavale <rohit.athavale@xilinx.com>")
 set(CPACK_PACKAGE_VENDOR "Xilinx")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Xilinx Multi-Scaler Plugin")
