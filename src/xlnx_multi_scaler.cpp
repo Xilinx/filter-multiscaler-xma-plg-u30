@@ -1,7 +1,7 @@
-/*       
+/*
  * Copyright (C) 2019, Xilinx Inc - All rights reserved
- * Xilinx Multiscaler XMA Plugin 
- *                                    
+ * Xilinx Multiscaler XMA Plugin
+ *
  * Licensed under the Apache License, Version 2.0 (the "License"). You may
  * not use this file except in compliance with the License. A copy of the
  * License is located at
@@ -11,9 +11,9 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations 
+ * License for the specific language governing permissions and limitations
  * under the License.
- */        
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -26,7 +26,6 @@
 #include <syslog.h>
 #include "xv_multi_scaler_hw.h"
 #include "xlnx_abr_scaler_coeffs.h"
-#include "xlnx_fixed_scaler_coeffs.h"
 
 #undef MEASURE_TIME
 #ifdef MEASURE_TIME
@@ -39,9 +38,12 @@
 #define XVBM_BUFF_PR(...)
 
 //#define DEBUG_MULTISCALE
+#define HDR_DATA_SUPPORT (1)
 
 #define MAX_OUTPOOL_BUFFERS   7
+#define MAX_OUTPOOL_BUFFERS_RETRIES 5
 #define MAX_PIPELINE_BUFFERS  2
+#define MAX_RETRIES_PER_CHAN 12
 
 #undef DUMP_INPUT_FRAMES
 
@@ -51,8 +53,10 @@
 #define MULTISCALER_PPC   4
 /* #define MULTISCALER_WIDTH_BYTES 16 // for 2ppc */
 /* #define MULTISCALER_WIDTH_BYTES 32 // for 4ppc */
-#define VCU_WIDTH_ALIGN   256
-#define VCU_HEIGHT_ALIGN  64
+#define SCL_IN_WIDTH_ALIGN   256
+#define SCL_IN_HEIGHT_ALIGN  64
+#define SCL_OUT_WIDTH_ALIGN   32
+#define SCL_OUT_HEIGHT_ALIGN  32
 
 #define MAX_WIDTH         3840
 #define MAX_HEIGHT        2160
@@ -136,23 +140,6 @@ typedef enum {
     XV_MULTI_SCALER_XPID_NUM_PARAMS
 }XV_MULTISCALER_XPARAM_INDEX;
 
-typedef enum {
-  XLXN_FIXED_COEFF_SR1,
-  XLXN_FIXED_COEFF_SR105,
-  XLXN_FIXED_COEFF_SR115,
-  XLXN_FIXED_COEFF_SR125,
-  XLXN_FIXED_COEFF_SR14,
-  XLXN_FIXED_COEFF_SR15,
-  XLXN_FIXED_COEFF_SR175,
-  XLXN_FIXED_COEFF_SR19,
-  XLXN_FIXED_COEFF_SR2,
-  XLXN_FIXED_COEFF_SR225,
-  XLXN_FIXED_COEFF_SR25,
-  XLXN_FIXED_COEFF_SR3,   
-  XLXN_FIXED_COEFF_TAPS_6,
-  XLXN_FIXED_COEFF_TAPS_12,  
-} XLNX_FIXED_FILTER_COEFF_TYPE;
-
 enum
 {
   XMA_COEFF_AUTO_GENERATE,
@@ -173,7 +160,9 @@ typedef struct MultiScalerContext
   uint32_t            pixel_rate[MAX_OUTPUTS];
   uint32_t            line_rate[MAX_OUTPUTS];
   uint32_t            in_stride[MAX_OUTPUTS];
+  uint32_t            in_hgt_align[MAX_OUTPUTS];
   uint32_t            out_stride[MAX_OUTPUTS];
+  uint32_t            out_hgt_align[MAX_OUTPUTS];
   ScalerFilterCoeffs  FilterCoeffs[MAX_OUTPUTS];
   XvbmPoolHandle      in_phandle;
   XvbmPoolHandle      out_phandle[MAX_OUTPUTS][MAX_VPLANES];
@@ -192,6 +181,9 @@ typedef struct MultiScalerContext
   bool                pool_extended;
   int8_t              current_pipe;
   int8_t              first_frame;
+#ifdef HDR_DATA_SUPPORT
+  XmaSideDataHandle   hdr_handle[MAX_OUTPOOL_BUFFERS];
+#endif
   XmaScalerSession    *session_mix_rate;
 #ifdef MEASURE_TIME
   int send_count;
@@ -206,10 +198,22 @@ typedef struct MultiScalerContext
   struct timespec   latency;
   long long int     time_taken;
   int               latency_logging;
-  uint8_t                   hw_reg[XV_MULTI_SCALER_CTRL_REGMAP_SIZE];
-  XV_MULTISCALER_DESCRIPTOR *desc;
-  XmaBufferObj              desc_buffer[MAX_OUTPUTS];
+  uint8_t                   hw_reg[MAX_PIPELINE_BUFFERS][XV_MULTI_SCALER_CTRL_REGMAP_SIZE];
+  XV_MULTISCALER_DESCRIPTOR *desc[MAX_PIPELINE_BUFFERS];
+  XmaBufferObj              desc_buffer[MAX_PIPELINE_BUFFERS][MAX_OUTPUTS];
+  int8_t                    pipe_idx;
+  int32_t           max_try[MAX_OUTPUTS];
+  int32_t           num_buffers_extended[MAX_OUTPUTS];
 } MultiScalerContext;
+
+static void scaler_clear_hdr_side_data(XmaFrame *frame)
+{
+    /* Clear HDR side data */
+    XmaSideDataHandle sd = xma_frame_get_side_data(frame, XMA_FRAME_HDR);
+    if(sd) {
+        xma_frame_remove_side_data_type(frame, XMA_FRAME_HDR);
+    }
+}
 
 static XmaParameter* get_parameter (XmaParameter *params, int num_params, const char  *name)
 {
@@ -227,12 +231,10 @@ static void get_user_params(XmaScalerSession *session)
    XmaParameter *param;
    MultiScalerContext *ctx = (MultiScalerContext*)session->base.plugin_data;
 
-  // With zero copy the pipeline option is not currently used in U30 .
-  // Disabled scaler pipeline option for now, as the existing pipeline causes issues in reading buffer. 
-  // It is sporadically reading old buffer state after xma_plg_is_work_item_done than the new and the issue is not limited to first few frames. 
-  //if ((param = get_parameter (session->props.params, session->props.param_cnt, "enable_pipeline")))
-  //     ctx->enable_pipeline = *(uint32_t*)param->value;
-  ctx->enable_pipeline = 0;
+  if ((param = get_parameter (session->props.params, session->props.param_cnt, "enable_pipeline")))
+       ctx->enable_pipeline = *(uint32_t*)param->value;
+  else
+      ctx->enable_pipeline = -1;
 
   if ((param = get_parameter (session->props.params, session->props.param_cnt, "MixRate")))
        ctx->session_mix_rate = (XmaScalerSession *)*(uint64_t *)param->value;
@@ -254,6 +256,8 @@ get_multiscaler_ip_format (XmaFormatType app_format)
 //    case XMA_YUV420_FMT_TYPE:
     case XMA_VCU_NV12_FMT_TYPE:
       return XV_MULTI_SCALER_Y_UV8_420;
+    case XMA_VCU_NV12_10LE32_FMT_TYPE:
+      return XV_MULTI_SCALER_Y_UV10_420;
     default:
       ERROR_PRINT ("Unsupported format...");
       return XV_MULTI_SCALER_NONE;
@@ -271,6 +275,8 @@ get_num_video_planes (XmaFormatType format)
 //      return 3;
     case XMA_VCU_NV12_FMT_TYPE: /* NV12 or VCU_NV12 */
       return 1;
+    case XMA_VCU_NV12_10LE32_FMT_TYPE: /* 10bit NV12 or VCU_NV12 */
+      return 1;
     default:
       ERROR_PRINT ("Unsupported format...");
       return -1;
@@ -278,7 +284,7 @@ get_num_video_planes (XmaFormatType format)
 }
 
 static int32_t
-get_plane_size (int32_t stride, int32_t height, XmaFormatType format, int32_t plane_id)
+get_plane_size (int32_t stride, int32_t height, XmaFormatType format, int32_t plane_id, int hgt_align)
 {
   switch (format) {
 //    case XMA_RGB888_FMT_TYPE: /* BGR */
@@ -299,108 +305,17 @@ get_plane_size (int32_t stride, int32_t height, XmaFormatType format, int32_t pl
 //          return -1;
 //      }
     case XMA_VCU_NV12_FMT_TYPE: /* VCU_NV12 */
+    case XMA_VCU_NV12_10LE32_FMT_TYPE: /* 10bit NV12 or VCU_NV12 */
       if (plane_id > 0) {
         ERROR_PRINT ("Wrong plane ID for VCU_NV12...");
         return -1;
       }
-      //return ((stride * ALIGN(height, VCU_HEIGHT_ALIGN)) + ((stride * height) >> 1));
-      return ((stride * ALIGN(height, VCU_HEIGHT_ALIGN) * 3)>>1);
+      return ((stride * ALIGN(height, hgt_align) * 3)>>1);
     default:
       ERROR_PRINT ("Unsupported format...");
       return -1;
   }
 }
-
-static void copy_filt_set(int16_t dest_filt[64][12], int set)
-{
-    int i=0, j=0;
-
-    for ( i=0; i<64; i++)
-    {
-        for ( j=0; j<12; j++)
-        {
-           switch(set)
-           {   
-              case XLXN_FIXED_COEFF_SR1:
-                      dest_filt[i][j] = fixed_coeff_SR1[i][j];//SR1.0
-                      break;
-              case XLXN_FIXED_COEFF_SR105: 
-                      dest_filt[i][j] = fixed_coeff_SR1_05[i][j]; //SR1.05
-                      break;
-              case XLXN_FIXED_COEFF_SR115: 
-                      dest_filt[i][j] = fixed_coeff_SR1_15[i][j]; //SR1.15 
-                      break;
-              case XLXN_FIXED_COEFF_SR125: 
-                      dest_filt[i][j] = fixed_coeff_SR1_25[i][j]; //SR2.5
-                      break;
-              case XLXN_FIXED_COEFF_SR14: 
-                      dest_filt[i][j] = fixed_coeff_SR1_4[i][j]; //SR1.4
-                      break;
-              case XLXN_FIXED_COEFF_SR175:
-                      dest_filt[i][j] = fixed_coeff_SR1_75[i][j]; //SR1.75
-                      break;
-              case XLXN_FIXED_COEFF_SR19:
-                      dest_filt[i][j] = fixed_coeff_SR1_9[i][j]; //SR1.9
-                      break;
-              case XLXN_FIXED_COEFF_SR2:
-                      dest_filt[i][j] = fixed_coeff_SR2_0[i][j]; //SR2.0
-                      break;	
-              case XLXN_FIXED_COEFF_SR225:
-                      dest_filt[i][j] = fixed_coeff_SR2_25[i][j]; //SR2.25
-                      break;	
-              case XLXN_FIXED_COEFF_SR25:
-                      dest_filt[i][j] = fixed_coeff_SR2_5[i][j]; //SR2.5
-                      break;					  
-              case XLXN_FIXED_COEFF_SR3:
-                      dest_filt[i][j] = fixed_coeff_SR3_0[i][j]; //SR3.0
-                      break;					  
-              case XLXN_FIXED_COEFF_TAPS_6:
-                      dest_filt[i][j] = fixed_coeff_taps6in12[i][j]; //6tap: Always used for up scale
-                      break;
-               case XLXN_FIXED_COEFF_TAPS_12:
-                      dest_filt[i][j] = fixed_coeff_taps12[i][j]; //smooth filter
-                      break;             					  
-              default:		
-                      dest_filt[i][j] = fixed_coeff_taps12[i][j]; //12tap
-                      break;		
-		   }
-        }		   
-    }
-}
-
-static int Select_filt_id(float down_scale_ratio)
-{
-    int filter_id = XLXN_FIXED_COEFF_TAPS_12;
-
-    if (down_scale_ratio == 1)
-       filter_id = XLXN_FIXED_COEFF_SR1;
-    else if (down_scale_ratio < 1.10) 
-       filter_id = XLXN_FIXED_COEFF_SR105;
-    else if (down_scale_ratio < 1.20) 
-       filter_id = XLXN_FIXED_COEFF_SR115;
-    else if (down_scale_ratio < 1.30) 
-       filter_id = XLXN_FIXED_COEFF_SR125;
-    else if (down_scale_ratio < 1.45) 
-       filter_id = XLXN_FIXED_COEFF_SR14;
-    else if (down_scale_ratio < 1.60) 
-       filter_id = XLXN_FIXED_COEFF_SR15;
-    else if (down_scale_ratio < 1.80) 
-       filter_id = XLXN_FIXED_COEFF_SR175;	
-    else if (down_scale_ratio < 1.95) 
-       filter_id = XLXN_FIXED_COEFF_SR19;
-    else if (down_scale_ratio < 2.15) 
-       filter_id = XLXN_FIXED_COEFF_SR2;
-    else if (down_scale_ratio < 2.24) 
-       filter_id = XLXN_FIXED_COEFF_SR225;
-    else if (down_scale_ratio < 2.6) 
-       filter_id = XLXN_FIXED_COEFF_SR25;	
-    else if (down_scale_ratio < 3.5) 
-       filter_id = XLXN_FIXED_COEFF_SR3;	  
-	  
-    return filter_id;
-	
-}
-
 
 static int32_t
 xlnx_multi_scaler_prepare_filter_tables (XmaScalerSession *session)
@@ -441,8 +356,18 @@ xlnx_multi_scaler_prepare_filter_tables (XmaScalerSession *session)
         /* upscaling default use 6 taps */
         filterSet[d][output_id] = XLXN_FIXED_COEFF_TAPS_6;
       } else {
-        /*Get index of downscale fixed filter*/
-        filterSet[d][output_id] = Select_filt_id(scale_ratio[d][output_id]);
+        if (scale_ratio[d][output_id] < 1.5)
+          filterSet[d][output_id] = XLXN_FIXED_COEFF_SR13;
+        else if ((scale_ratio[d][output_id] >= 1.5) && (scale_ratio[d][output_id] < 2))
+          filterSet[d][output_id] = XLXN_FIXED_COEFF_SR15;
+        else if ((scale_ratio[d][output_id] >= 2) && (scale_ratio[d][output_id] < 2.5))
+          filterSet[d][output_id] = XLXN_FIXED_COEFF_SR2;
+        else if ((scale_ratio[d][output_id] >= 2.5) && (scale_ratio[d][output_id] < 3))
+          filterSet[d][output_id] = XLXN_FIXED_COEFF_SR25;
+        else if ((scale_ratio[d][output_id] >= 3) && (scale_ratio[d][output_id] < 3.5))
+          filterSet[d][output_id] = XLXN_FIXED_COEFF_TAPS_10;
+        else
+          filterSet[d][output_id] = XLXN_FIXED_COEFF_TAPS_12;
       }
       DEBUG_PRINT ("channel = %d, %s scaling ratio = %f and chosen filter type = %d", output_id, d == 0 ? "width" : "height",
           scale_ratio[d][output_id], filterSet[d][output_id]);
@@ -480,8 +405,8 @@ xlnx_multi_scaler_prepare_filter_tables (XmaScalerSession *session)
     } else { //XMA_COEFF_USE_DEFAULT
       /* get fixed horizontal filters*/
       DEBUG_PRINT ("Consider predefined horizontal filter coefficients");
-
       copy_filt_set((ctx->FilterCoeffs[output_id].HfltCoeff), filterSet[0][output_id]);
+
       /* get fixed vertical filters*/
       DEBUG_PRINT ("Consider predefined vertical filter coefficients");
       copy_filt_set((ctx->FilterCoeffs[output_id].VfltCoeff), filterSet[1][output_id]);
@@ -547,18 +472,17 @@ multi_scaler_allocate_buffers (XmaScalerSession *session)
   XmaSession xma_session = session->base;
   MultiScalerContext *ctx = (MultiScalerContext*)session->base.plugin_data;
   int output_id = 0, ret=0;
-  int plane_id;
+  int plane_id, pipe_id;
   int max_outputs   = MIN(ctx->num_outs, MAX_OUTPUTS);
-  int ddr_bank_index = xma_session.hw_session.bank_index;  
+  int ddr_bank_index = xma_session.hw_session.bank_index;
   size_t        b_size;
   XmaBufferObj  bo_handle;
   XvbmPoolHandle  p_handle;
 
   /* allocate input buffers */
   xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Allocate buffer pool for input ->");
-
-  b_size = ((ALIGN(session->props.input.width,  VCU_WIDTH_ALIGN) * 
-             ALIGN(session->props.input.height, VCU_HEIGHT_ALIGN)) * 3) >> 1;
+  b_size = (ctx->in_stride[0] * ALIGN(session->props.input.height,
+           SCL_IN_HEIGHT_ALIGN)) * 1.5;
 
   p_handle = xvbm_buffer_pool_create(xma_plg_get_dev_handle(xma_session),
                                      1,
@@ -570,9 +494,8 @@ multi_scaler_allocate_buffers (XmaScalerSession *session)
   }
   ctx->in_phandle = p_handle;
   xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "    Created Pool %p (%4d x %4d)\n",ctx->in_phandle,
-                  ALIGN(session->props.input.width,  VCU_WIDTH_ALIGN),
-                  ALIGN(session->props.input.height, VCU_HEIGHT_ALIGN));
-
+                  ALIGN(session->props.input.width,  SCL_IN_WIDTH_ALIGN),
+                  ALIGN(session->props.input.height, SCL_IN_HEIGHT_ALIGN));
   /* allocate output buffers */
   xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Allocate buffer pool for output channels ->");
 
@@ -580,10 +503,9 @@ multi_scaler_allocate_buffers (XmaScalerSession *session)
     xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "    [Chan id=%d]", output_id);
 
     for (plane_id = 0; plane_id < get_num_video_planes(session->props.output[output_id].format); plane_id++) {
-      b_size = get_plane_size(ctx->out_stride[output_id],
-                              ctx->out_height[output_id],
+      b_size = get_plane_size(ctx->out_stride[output_id], ctx->out_height[output_id],
                               session->props.output[output_id].format,
-                              plane_id);
+                              plane_id,  SCL_OUT_HEIGHT_ALIGN);
       /* For normal session allocate buffers from new pool */
       if (!ctx->session_mix_rate) {
           p_handle = xvbm_buffer_pool_create(xma_plg_get_dev_handle(xma_session),
@@ -598,7 +520,7 @@ multi_scaler_allocate_buffers (XmaScalerSession *session)
           xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "      [plane_id: %d]:: Created Pool %p (%4d x %4d)\n",plane_id,
                           ctx->out_phandle[output_id][plane_id],
                           ctx->out_stride[output_id],
-                          ALIGN(ctx->out_height[output_id], VCU_HEIGHT_ALIGN));
+                          ctx->out_hgt_align[output_id]);
       } else {
         /* For mix_rate session extend the pool allocated in previous session */
         MultiScalerContext *mixrate_ctx = (MultiScalerContext *)ctx->session_mix_rate->base.plugin_data;
@@ -667,21 +589,25 @@ multi_scaler_allocate_buffers (XmaScalerSession *session)
     }
 
     //Allocate device buffer for DDR Register Descriptor
-    b_size = sizeof(*ctx->desc);
-    bo_handle = xma_plg_buffer_alloc(xma_session, b_size, false, &ret);
-    if (ret == XMA_SUCCESS) {
-      ctx->desc_buffer[output_id] = bo_handle;
-    } else {
-      ERROR_PRINT("Command Block Device Buffer Allocation Failed");
-      goto cleanup;
+    for (pipe_id = 0; pipe_id < MAX_PIPELINE_BUFFERS; pipe_id++) {
+      b_size = sizeof(*ctx->desc[pipe_id]);
+      bo_handle = xma_plg_buffer_alloc(xma_session, b_size, false, &ret);
+      if (ret == XMA_SUCCESS) {
+        ctx->desc_buffer[pipe_id][output_id] = bo_handle;
+      } else {
+        ERROR_PRINT("Command Block Device Buffer Allocation Failed");
+        goto cleanup;
+      }
     }
   }
 
   //Allocate HOST memory for DDR Register Descriptor Context
-  ctx->desc = (XV_MULTISCALER_DESCRIPTOR *)calloc(max_outputs, sizeof(*ctx->desc));
-  if(!ctx->desc) {
-    ERROR_PRINT("HW Descriptor Host Memory Allocation Failed");
-    goto cleanup;
+  for (pipe_id = 0; pipe_id < MAX_PIPELINE_BUFFERS; pipe_id++) {
+    ctx->desc[pipe_id] = (XV_MULTISCALER_DESCRIPTOR *)calloc(max_outputs, sizeof(*ctx->desc[0]));
+    if(!ctx->desc[pipe_id]) {
+      ERROR_PRINT("HW Descriptor Host Memory Allocation Failed");
+      goto cleanup;
+    }
   }
 
   return XMA_SUCCESS;
@@ -703,13 +629,17 @@ cleanup:
       xma_plg_buffer_free(xma_session, ctx->VfltCoeff_Buffer[output_id]);
     }
 
-    if(ctx->desc_buffer[output_id].data) {
-      xma_plg_buffer_free(xma_session, ctx->desc_buffer[output_id]);
-     }
+    for (pipe_id = 0; pipe_id < MAX_PIPELINE_BUFFERS; pipe_id++) {
+      if(ctx->desc_buffer[pipe_id][output_id].data) {
+        xma_plg_buffer_free(xma_session, ctx->desc_buffer[pipe_id][output_id]);
+       }
+    }
   }/* output_id */
 
-  if (ctx->desc)
-    free(ctx->desc);
+  for (pipe_id = 0; pipe_id < MAX_PIPELINE_BUFFERS; pipe_id++) {
+    if (ctx->desc[pipe_id])
+      free(ctx->desc[pipe_id]);
+  }
 
   return XMA_ERROR;
 }
@@ -736,46 +666,46 @@ void print_desc_config(XmaScalerSession *session)
 
   xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "--------- HW REG Configuration ---------");
   for (i=XV_MULTI_SCALER_CTRL_ADDR_NUM_OUTS_DATA; i<XV_MULTI_SCALER_CTRL_REGMAP_SIZE; i+=4) {
-      //value = *(uint32_t *)&ctx->hw_reg[i];
-      memcpy(&value, &ctx->hw_reg[i], sizeof(uint32_t));
+      //value = *(uint32_t *)&ctx->hw_reg[ctx->pipe_idx][i];
+      memcpy(&value, &ctx->hw_reg[ctx->pipe_idx][i], sizeof(uint32_t));
       xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Reg Addr 0x%02x = 0x%x\n", i, value);
   }
   xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "----------------------------------------");
 
   xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "--------- Descriptor Block Configuration ---------");
-  xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Desc block start addr : %p\n", (void *)ctx->desc_buffer[0].paddr);
+  xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Desc block start addr : %p\n", (void *)ctx->desc_buffer[ctx->pipe_idx][0].paddr);
   xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Num output channels   : %d\n", ctx->num_outs);
 
   for (output_id = 0; output_id < ctx->num_outs; output_id++) {
       xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "--------- Channel-id %d Start---------", output_id);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Width_In            : %4d",ctx->desc[output_id].widthIn);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Width_Out           : %4d",ctx->desc[output_id].widthOut);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Height_In           : %4d",ctx->desc[output_id].heightIn);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Height_Out          : %4d",ctx->desc[output_id].heightOut);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "StrideIn            : %4d",ctx->desc[output_id].strideIn);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "StrideOut           : %4d",ctx->desc[output_id].strideOut);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "PixelFmt_In         : %4d",ctx->desc[output_id].inPixelFmt);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "PixelFmt_Out        : %4d",ctx->desc[output_id].outPixelFmt);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "PixelRate           : %4d",ctx->desc[output_id].pixelRate);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "LineRate            : %4d",ctx->desc[output_id].lineRate);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "HorzFilterCoeffAddr : %p", (void *)ctx->desc[output_id].hfltCoeffAddr);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "VertFilterCoeffAddr : %p", (void *)ctx->desc[output_id].vfltCoeffAddr);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Width_In            : %4d",ctx->desc[ctx->pipe_idx][output_id].widthIn);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Width_Out           : %4d",ctx->desc[ctx->pipe_idx][output_id].widthOut);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Height_In           : %4d",ctx->desc[ctx->pipe_idx][output_id].heightIn);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Height_Out          : %4d",ctx->desc[ctx->pipe_idx][output_id].heightOut);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "StrideIn            : %4d",ctx->desc[ctx->pipe_idx][output_id].strideIn);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "StrideOut           : %4d",ctx->desc[ctx->pipe_idx][output_id].strideOut);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "PixelFmt_In         : %4d",ctx->desc[ctx->pipe_idx][output_id].inPixelFmt);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "PixelFmt_Out        : %4d",ctx->desc[ctx->pipe_idx][output_id].outPixelFmt);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "PixelRate           : %4d",ctx->desc[ctx->pipe_idx][output_id].pixelRate);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "LineRate            : %4d",ctx->desc[ctx->pipe_idx][output_id].lineRate);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "HorzFilterCoeffAddr : %p", (void *)ctx->desc[ctx->pipe_idx][output_id].hfltCoeffAddr);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "VertFilterCoeffAddr : %p", (void *)ctx->desc[ctx->pipe_idx][output_id].vfltCoeffAddr);
       char msg[256];
       strcpy (msg, "SrcImgAddr(Planes)  : ");
       for (i = 0; i < get_num_video_planes(session->props.output[output_id].format); i++) {
           char msg2[256];
-          sprintf(msg2, "%s[%d] = %p%s", msg, i, (void *)ctx->desc[output_id].srcImgBuf[i], (i < get_num_video_planes(session->props.output[output_id].format) - 1) ? ", " : "");
+          sprintf(msg2, "%s[%d] = %p%s", msg, i, (void *)ctx->desc[ctx->pipe_idx][output_id].srcImgBuf[i], (i < get_num_video_planes(session->props.output[output_id].format) - 1) ? ", " : "");
           strcpy (msg, msg2);
       }
       xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, msg);
       strcpy (msg, "DstImgAddr(Planes)  : ");
       for (i = 0; i < get_num_video_planes(session->props.output[output_id].format); i++) {
           char msg2[256];
-          sprintf(msg2, "%s[%d] = %p%s", msg, i, (void *)ctx->desc[output_id].dstImgBuf[i], (i < get_num_video_planes(session->props.output[output_id].format) - 1) ? ", " : "");
+          sprintf(msg2, "%s[%d] = %p%s", msg, i, (void *)ctx->desc[ctx->pipe_idx][output_id].dstImgBuf[i], (i < get_num_video_planes(session->props.output[output_id].format) - 1) ? ", " : "");
           strcpy (msg, msg2);
       }
       xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, msg);
-      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "nextAddr            : %p",(void *)ctx->desc[output_id].nxtaddr);
+      xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "nextAddr            : %p",(void *)ctx->desc[ctx->pipe_idx][output_id].nxtaddr);
       xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "--------- Channel-id %d End---------", output_id);
   }
 }
@@ -793,18 +723,18 @@ static void write_desc_data_to_device(XmaScalerSession *session)
 
   for (output_id = 0; output_id < max_outputs ; output_id++) {
     //copy host config data to allocated device buffer
-    memcpy(ctx->desc_buffer[output_id].data,
-           &ctx->desc[output_id],
-           ctx->desc_buffer[output_id].size);
+    memcpy(ctx->desc_buffer[ctx->pipe_idx][output_id].data,
+           &ctx->desc[ctx->pipe_idx][output_id],
+           ctx->desc_buffer[ctx->pipe_idx][output_id].size);
 
     //send config data to device
     xma_plg_buffer_write(xma_session,
-                         ctx->desc_buffer[output_id],
-                         ctx->desc_buffer[output_id].size, 0);
+                         ctx->desc_buffer[ctx->pipe_idx][output_id],
+                         ctx->desc_buffer[ctx->pipe_idx][output_id].size, 0);
   }
   //set device ddr start address for desc data in hw_reg
-  memcpy((ctx->hw_reg + XV_MULTI_SCALER_CTRL_ADDR_START_ADDR_DATA), 
-         &(ctx->desc_buffer[0].paddr),
+  memcpy((ctx->hw_reg[ctx->pipe_idx] + XV_MULTI_SCALER_CTRL_ADDR_START_ADDR_DATA),
+         &(ctx->desc_buffer[ctx->pipe_idx][0].paddr),
          sizeof(uint64_t));
 }
 
@@ -813,73 +743,75 @@ static int32_t write_registers(XmaScalerSession *session)
   XmaSession xma_session = session->base;
   MultiScalerContext *ctx = (MultiScalerContext*)session->base.plugin_data;
   uint32_t value;
-  int output_id;
+  int output_id, pipe_id;
   int max_outputs = MIN(ctx->num_outs, MAX_OUTPUTS);
 
-  /* write num outputs */
-  value = ctx->num_outs;
-  memcpy((ctx->hw_reg + XV_MULTI_SCALER_CTRL_ADDR_NUM_OUTS_DATA), &value, sizeof(value));
+  for (pipe_id = 0; pipe_id < MAX_PIPELINE_BUFFERS; pipe_id++) {
+    /* write num outputs */
+    value = ctx->num_outs;
+    memcpy((ctx->hw_reg[pipe_id] + XV_MULTI_SCALER_CTRL_ADDR_NUM_OUTS_DATA), &value, sizeof(value));
 
-  for (output_id = 0; output_id < max_outputs ; output_id++) {
-    /*in_height*/
-    ctx->desc[output_id].heightIn = ctx->in_height[output_id];
+    for (output_id = 0; output_id < max_outputs ; output_id++) {
+      /*in_height*/
+      ctx->desc[pipe_id][output_id].heightIn = ctx->in_height[output_id];
 
-    /*in_width*/
-    ctx->desc[output_id].widthIn = ctx->in_width[output_id];
+      /*in_width*/
+      ctx->desc[pipe_id][output_id].widthIn = ctx->in_width[output_id];
 
-    /*out_height*/
-    ctx->desc[output_id].heightOut = ctx->out_height[output_id];
+      /*out_height*/
+      ctx->desc[pipe_id][output_id].heightOut = ctx->out_height[output_id];
 
-    /*out_width*/
-    ctx->desc[output_id].widthOut = ctx->out_width[output_id];
+      /*out_width*/
+      ctx->desc[pipe_id][output_id].widthOut = ctx->out_width[output_id];
 
-    /*in_format*/
-    ctx->desc[output_id].inPixelFmt = ctx->in_format[output_id];
+      /*in_format*/
+      ctx->desc[pipe_id][output_id].inPixelFmt = ctx->in_format[output_id];
 
-    /*out_format*/
-    ctx->desc[output_id].outPixelFmt = ctx->out_format[output_id];
+      /*out_format*/
+      ctx->desc[pipe_id][output_id].outPixelFmt = ctx->out_format[output_id];
 
-    /*pixel_rate*/
-    ctx->desc[output_id].pixelRate = ctx->pixel_rate[output_id];
+      /*pixel_rate*/
+      ctx->desc[pipe_id][output_id].pixelRate = ctx->pixel_rate[output_id];
 
-    /*line_rate*/
-    ctx->desc[output_id].lineRate = ctx->line_rate[output_id];
+      /*line_rate*/
+      ctx->desc[pipe_id][output_id].lineRate = ctx->line_rate[output_id];
 
-    /*in_stride*/
-    ctx->desc[output_id].strideIn = ctx->in_stride[output_id];
+      /*in_stride*/
+      ctx->desc[pipe_id][output_id].strideIn = ctx->in_stride[output_id];
 
-    /*out_stride*/
-    ctx->desc[output_id].strideOut = ctx->out_stride[output_id];
+      /*out_stride*/
+      ctx->desc[pipe_id][output_id].strideOut = ctx->out_stride[output_id];
 
-    /*Filter coefficients*/
-    ctx->desc[output_id].hfltCoeffAddr = ctx->HfltCoeff_Buffer[output_id].paddr;
-    ctx->desc[output_id].vfltCoeffAddr = ctx->VfltCoeff_Buffer[output_id].paddr;
+      /*Filter coefficients*/
+      ctx->desc[pipe_id][output_id].hfltCoeffAddr = ctx->HfltCoeff_Buffer[output_id].paddr;
+      ctx->desc[pipe_id][output_id].vfltCoeffAddr = ctx->VfltCoeff_Buffer[output_id].paddr;
 
-    //copy Horz Filter Coeffs to allocated buffer
-    memcpy(ctx->HfltCoeff_Buffer[output_id].data,
-           ctx->FilterCoeffs[output_id].HfltCoeff,
-           ctx->HfltCoeff_Buffer[output_id].size);
+      //copy Horz Filter Coeffs to allocated buffer
+      memcpy(ctx->HfltCoeff_Buffer[output_id].data,
+             ctx->FilterCoeffs[output_id].HfltCoeff,
+             ctx->HfltCoeff_Buffer[output_id].size);
 
-    //send Horz Filter Data to device
-    xma_plg_buffer_write(xma_session,
-                         ctx->HfltCoeff_Buffer[output_id],
-                         ctx->HfltCoeff_Buffer[output_id].size, 0);
+      //send Horz Filter Data to device
+      xma_plg_buffer_write(xma_session,
+                           ctx->HfltCoeff_Buffer[output_id],
+                           ctx->HfltCoeff_Buffer[output_id].size, 0);
 
-    //copy Vert Filter Coeffs to allocated buffer
-    memcpy(ctx->VfltCoeff_Buffer[output_id].data,
-           ctx->FilterCoeffs[output_id].VfltCoeff,
-           ctx->VfltCoeff_Buffer[output_id].size);
+      //copy Vert Filter Coeffs to allocated buffer
+      memcpy(ctx->VfltCoeff_Buffer[output_id].data,
+             ctx->FilterCoeffs[output_id].VfltCoeff,
+             ctx->VfltCoeff_Buffer[output_id].size);
 
-    //send Vert Filter Data to device
-    xma_plg_buffer_write(xma_session,
-                         ctx->VfltCoeff_Buffer[output_id],
-                         ctx->VfltCoeff_Buffer[output_id].size, 0);
+      //send Vert Filter Data to device
+      xma_plg_buffer_write(xma_session,
+                           ctx->VfltCoeff_Buffer[output_id],
+                           ctx->VfltCoeff_Buffer[output_id].size, 0);
 
-    //set address of next block, in device memory
-    if (output_id < (max_outputs-1)) {
-        ctx->desc[output_id].nxtaddr = ctx->desc_buffer[output_id+1].paddr;
-    } else {
-        ctx->desc[output_id].nxtaddr = 0;
+      //set address of next block, in device memory
+      if (output_id < (max_outputs-1)) {
+          ctx->desc[pipe_id][output_id].nxtaddr = ctx->desc_buffer[pipe_id][output_id+1].paddr;
+      } else {
+          ctx->desc[pipe_id][output_id].nxtaddr = 0;
+      }
     }
   }
   return XMA_SUCCESS;
@@ -897,10 +829,10 @@ xlnx_multi_scaler_init(XmaScalerSession *session)
   MultiScalerContext *ctx = (MultiScalerContext*)session->base.plugin_data;
   int output_id = 0;
   int max_outputs;
-  //XmaParameter* param;  
+  //XmaParameter* param;
   int32_t xma_ret = XMA_SUCCESS;
 
-  ctx->enable_pipeline  = 0;
+  ctx->enable_pipeline  = -1;
   ctx->session_mix_rate = NULL;
   syslog(LOG_DEBUG, "xma_scaler_handle = %p\n", ctx);
   clock_gettime (CLOCK_REALTIME, &ctx->latency);
@@ -913,7 +845,7 @@ xlnx_multi_scaler_init(XmaScalerSession *session)
 
   //extract user extended property params
   get_user_params(session);
-  xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "MultiScaler Pipeline Mode: %s", ((ctx->enable_pipeline)  ? "Enabled" : "Disabled"));
+  xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "MultiScaler Pipeline Mode: %s", ((ctx->enable_pipeline == 1)  ? "Enabled" : ((ctx->enable_pipeline == 0) ? "Disabled" : "Automatic")));
   if (ctx->session_mix_rate)
     xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "MultiScaler MixRate  Mode: Enabled");
 
@@ -925,6 +857,7 @@ xlnx_multi_scaler_init(XmaScalerSession *session)
   ctx->sent_frame_cnt = 0;
   ctx->s_idx = 0;
   ctx->r_idx = 0;
+  ctx->pipe_idx = 0;
 
   if (ctx->num_outs > MAX_OUTPUTS) {
      ERROR_PRINT("Number of outputs programmed %d, exceeds Maximum supported outputs %d.", ctx->num_outs, MAX_OUTPUTS);
@@ -939,7 +872,7 @@ xlnx_multi_scaler_init(XmaScalerSession *session)
      ERROR_PRINT("in_width=%d is not supported as it is not a multiple of %d.\n",session->props.input.width,MULTISCALER_PPC );
      return XMA_ERROR;
   }
-  
+
   if ((session->props.input.height % MULTISCALER_PPC) > 0) {
      ERROR_PRINT("in_height=%d is not supported as it is not a multiple of %d.\n",session->props.input.height,MULTISCALER_PPC );
      return XMA_ERROR;
@@ -950,18 +883,45 @@ xlnx_multi_scaler_init(XmaScalerSession *session)
       ctx->in_height[output_id] = session->props.input.height;
       ctx->in_width[output_id]  = session->props.input.width;
       ctx->in_format[output_id] = get_multiscaler_ip_format(session->props.input.format);
-      ctx->in_stride[output_id] = MULTISCALER_ALIGN(session->props.input.stride, VCU_WIDTH_ALIGN);
+
+      if (ctx->in_format[output_id] == XV_MULTI_SCALER_Y_UV10_420)
+      {
+         ctx->in_stride[output_id] = MULTISCALER_ALIGN(((session->props.input.width + 2) / 3) * 4, SCL_IN_WIDTH_ALIGN);
+      }
+      else
+      {
+         ctx->in_stride[output_id] = MULTISCALER_ALIGN(session->props.input.width, SCL_IN_WIDTH_ALIGN);
+      }
+      ctx->in_hgt_align[output_id] = MULTISCALER_ALIGN(ctx->in_height[output_id], SCL_IN_HEIGHT_ALIGN);
     } else {
       /* assign input parameters with previous channel output paramters */
       ctx->in_height[output_id] = session->props.output[output_id-1].height;
       ctx->in_width[output_id]  = session->props.output[output_id-1].width;
       ctx->in_format[output_id] = get_multiscaler_ip_format(session->props.output[output_id-1].format);
-      ctx->in_stride[output_id] = MULTISCALER_ALIGN(session->props.output[output_id-1].stride, VCU_WIDTH_ALIGN);
+      if (ctx->in_format[output_id] == XV_MULTI_SCALER_Y_UV10_420)
+      {
+         ctx->in_stride[output_id] = MULTISCALER_ALIGN(((session->props.output[output_id-1].width + 2) / 3) * 4, SCL_OUT_WIDTH_ALIGN);
+      }
+      else
+      {
+        ctx->in_stride[output_id] = MULTISCALER_ALIGN(session->props.output[output_id-1].width, SCL_OUT_WIDTH_ALIGN);
+      }
+      ctx->in_hgt_align[output_id] = ctx->out_hgt_align[output_id-1];
     }
+
     ctx->out_height[output_id] = session->props.output[output_id].height;
     ctx->out_width[output_id]  = session->props.output[output_id].width;
     ctx->out_format[output_id] = get_multiscaler_ip_format(session->props.output[output_id].format);
-    ctx->out_stride[output_id] = MULTISCALER_ALIGN(session->props.output[output_id].stride, VCU_WIDTH_ALIGN);
+    if (ctx->out_format[output_id] == XV_MULTI_SCALER_Y_UV10_420)
+    {
+      ctx->out_stride[output_id] = MULTISCALER_ALIGN(((ctx->out_width[output_id] + 2) / 3) * 4, SCL_OUT_WIDTH_ALIGN);
+    }
+    else
+    {
+      ctx->out_stride[output_id] = MULTISCALER_ALIGN(ctx->out_width[output_id] , SCL_OUT_WIDTH_ALIGN);
+    }
+
+    ctx->out_hgt_align[output_id] = MULTISCALER_ALIGN(ctx->out_height[output_id], SCL_OUT_HEIGHT_ALIGN);
 
     //check if resolution is within the limits (landscape or portrait mode)
     if ((ctx->in_width[output_id]<=0)   || (ctx->in_width[output_id]>MAX_WIDTH)   ||
@@ -976,7 +936,7 @@ xlnx_multi_scaler_init(XmaScalerSession *session)
              ctx->out_height[output_id],MAX_WIDTH,MAX_HEIGHT,MAX_HEIGHT,MAX_WIDTH);
          return XMA_ERROR;
     }
-    
+
     if ((ctx->out_width[output_id] % MULTISCALER_PPC) > 0) {
         ERROR_PRINT("out_%d_width=%d is not supported as it is not a multiple of %d.\n",output_id+1, ctx->out_width[output_id],MULTISCALER_PPC );
         return XMA_ERROR;
@@ -1047,53 +1007,62 @@ xlnx_multi_scaler_init(XmaScalerSession *session)
 
 static int get_raw_host_frame(MultiScalerContext *ctx, XmaFrame *frame)
 {
-  uint8_t *src, *dst;
-  size_t size_y, size_uv;
-  int16_t src_stride, dst_stride;
-  int16_t a_height;
-  int ret = 0;
-  int i;
-
   ctx->in_bhandle[ctx->s_idx] = xvbm_buffer_pool_entry_alloc (ctx->in_phandle);
-  uint8_t *dst_start_ptr = (uint8_t *)xvbm_buffer_get_host_ptr(ctx->in_bhandle[ctx->s_idx]);
-
-  a_height = ALIGN(ctx->in_height[0], VCU_HEIGHT_ALIGN);
-  size_y   = ((size_t)ctx->in_stride[0] * a_height);
-  size_uv  = size_y >> 1;
-  dst = dst_start_ptr;
-
-  if ((frame->frame_props.linesize[0] != (int32_t)ctx->in_stride[0]) ||
-      (frame->frame_props.height      != a_height))
-  {
-      //PLANE_Y
-      src        = (uint8_t *)frame->data[0].buffer;
-      src_stride = frame->frame_props.linesize[0];
-      dst_stride = ctx->in_stride[0];
-      for(i = 0; i < frame->frame_props.height; ++i) {
-          memcpy(dst, src, frame->frame_props.width);
-          src += src_stride;
-          dst += dst_stride;
-      }
-      //PLANE_UV
-      src = (uint8_t *)frame->data[1].buffer;
-      dst = dst_start_ptr;
-      dst += size_y;
-      src_stride = frame->frame_props.linesize[1];
-      dst_stride = ctx->in_stride[0];
-      for(i = 0; i < frame->frame_props.height/2; ++i) {
-          memcpy(dst, src, frame->frame_props.width);
-          src += src_stride;
-          dst += dst_stride;
-      }
-  } else {
-      memcpy(dst, frame->data[0].buffer, size_y);
-      dst += size_y;
-      memcpy(dst, frame->data[1].buffer, size_uv);
+  if(!ctx->in_bhandle[ctx->s_idx]) {
+      xma_logmsg(XMA_ERROR_LOG, XMA_MULTISCALER, "Error: (%s) Buffer Pool full - no free buffer available\n", __func__);
+      return XMA_ERROR;
   }
-  ret = xvbm_buffer_write(ctx->in_bhandle[ctx->s_idx],
-                          dst_start_ptr,
-                          (size_y+size_uv), 0);
-  return (ret);
+  uint8_t* src_buffer;
+  uint8_t* device_buffer      = (uint8_t *)xvbm_buffer_get_host_ptr(ctx->in_bhandle[ctx->s_idx]);
+  uint16_t src_bytes_in_line  = frame->frame_props.linesize[0];
+  uint16_t dev_bytes_in_line  = ALIGN(src_bytes_in_line, SCL_IN_WIDTH_ALIGN);
+  uint16_t src_height         = frame->frame_props.height;
+  uint16_t dev_height         = ALIGN(src_height, SCL_IN_HEIGHT_ALIGN);
+
+  uint16_t dev_rows_in_plane = dev_height;
+  uint16_t src_rows_in_plane = src_height;
+  size_t dev_index = 0;
+
+  size_t dev_y_size           = dev_bytes_in_line * dev_height;
+  int ret                     = 0;
+  if (src_bytes_in_line != dev_bytes_in_line) {
+      uint16_t dev_rows_in_plane = dev_height;
+      uint16_t src_rows_in_plane = src_height;
+      size_t dev_index = 0;
+      for (int plane_id = 0; plane_id < xma_frame_planes_get(&frame->frame_props);
+              plane_id++) {
+          size_t src_index = 0;
+          src_buffer = (uint8_t *)frame->data[plane_id].buffer;
+          if(plane_id > 0) {
+              dev_rows_in_plane = dev_height / 2;
+              src_rows_in_plane = src_height / 2;
+          }
+          for(uint16_t h = 0; h < src_rows_in_plane; h++) {
+              for(uint16_t w = 0; w < src_bytes_in_line; w++) {
+                  if(w < src_bytes_in_line && h < src_rows_in_plane) {
+                      device_buffer[dev_index] = src_buffer[src_index];
+                      src_index++;
+                  }
+                  dev_index++;
+              }
+              dev_index += dev_bytes_in_line - src_bytes_in_line;
+          }
+          dev_index += dev_bytes_in_line * (dev_rows_in_plane - src_rows_in_plane);
+      }
+      ret = xvbm_buffer_write(ctx->in_bhandle[ctx->s_idx], device_buffer,
+                              (3 * dev_y_size) >> 1, 0);
+  } else {
+    if (frame->data[0].buffer + dev_y_size == frame->data[1].buffer) {
+        ret = xvbm_buffer_write(ctx->in_bhandle[ctx->s_idx], frame->data[0].buffer, (dev_y_size *3 ) >> 1, 0);
+    } else {
+        size_t src_y_size = src_bytes_in_line * src_height;
+        ret = xvbm_buffer_write(ctx->in_bhandle[ctx->s_idx], frame->data[0].buffer, src_y_size, 0);
+        if (!ret) {
+            xvbm_buffer_write(ctx->in_bhandle[ctx->s_idx], frame->data[1].buffer, src_y_size >> 1, dev_y_size);
+        }
+    }
+  }
+  return ret;
 }
 
 /* Writes input buffer at channel-0 */
@@ -1105,16 +1074,18 @@ prep_and_write_input_buffer (XmaScalerSession *session, int32_t buf_idx, XmaFram
   uint64_t offset;
 
   (void)buf_idx; //unused param
-  if (session->props.input.format == XMA_VCU_NV12_FMT_TYPE) {
-    if (frame->data[0].buffer_type == XMA_DEVICE_BUFFER_TYPE)	
+  if ((session->props.input.format == XMA_VCU_NV12_FMT_TYPE) || ( session->props.input.format == XMA_VCU_NV12_10LE32_FMT_TYPE)) {
+    if (frame->data[0].buffer_type == XMA_DEVICE_BUFFER_TYPE)
        ctx->in_bhandle[ctx->s_idx] = (XvbmBufferHandle)(frame->data[0].buffer);
     else {
         if(get_raw_host_frame(ctx, frame)) {
           ERROR_PRINT("host buffer write failed\n");
           return XMA_ERROR;
         }
+        if (ctx->enable_pipeline != 0)
+            ctx->enable_pipeline = 1;
     }
-   
+
     if (ctx->in_bhandle[ctx->s_idx]) {
       //Extend Input Pool, if needed
       if (!ctx->pool_extended) {
@@ -1128,13 +1099,9 @@ prep_and_write_input_buffer (XmaScalerSession *session, int32_t buf_idx, XmaFram
         xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Num of buffers allocated in previous component = %d\n", num);
         /* Depending on available XRT buffer, pool can be extended more (currently 4) */
 
-        uint32_t extend_cnt_needed = 0;
-        if (ctx->enable_pipeline)
-          extend_cnt_needed = 2;
-  
         uint32_t cnt = xvbm_buffer_pool_extend(ctx->in_bhandle[ctx->s_idx],
-                                               MAX_PIPELINE_BUFFERS + extend_cnt_needed);
-        if (cnt == num + MAX_PIPELINE_BUFFERS + extend_cnt_needed) {
+                                               MAX_PIPELINE_BUFFERS);
+        if (cnt == num + MAX_PIPELINE_BUFFERS) {
           ctx->pool_extended = true;
           xma_logmsg(XMA_DEBUG_LOG, XMA_MULTISCALER, "Extended previous component's output pool to %d buffers\n", cnt);
         } else {
@@ -1151,14 +1118,14 @@ prep_and_write_input_buffer (XmaScalerSession *session, int32_t buf_idx, XmaFram
       XVBM_BUFF_PR("\tMS Recv buffer from DEC =%p ID = %d\n",
                     ctx->in_bhandle[ctx->s_idx],
                     xvbm_buffer_get_id(ctx->in_bhandle[ctx->s_idx]));
-      
+
       paddr = xvbm_buffer_get_paddr(ctx->in_bhandle[ctx->s_idx]);
-      ctx->desc[0].srcImgBuf[0] = paddr;
+      ctx->desc[ctx->pipe_idx][0].srcImgBuf[0] = paddr;
 
       /* prep_write plane-1 with offset stride * elevation */
-      offset = ctx->in_stride[0] * ALIGN(ctx->in_height[0], VCU_HEIGHT_ALIGN);
+      offset = ctx->in_stride[0] * ctx->in_hgt_align[0];
       paddr += offset;
-      ctx->desc[0].srcImgBuf[1] = paddr;
+      ctx->desc[ctx->pipe_idx][0].srcImgBuf[1] = paddr;
     } else {
         ERROR_PRINT ("invalid input buffer handle in scaler\n");
         return XMA_ERROR;
@@ -1180,30 +1147,58 @@ prepare_inout_buffers (XmaScalerSession *session, int32_t buf_idx)
   int32_t output_id;
   int32_t plane_id = 0;
   uint64_t value = 0;
-  int32_t max_try = 0;
   uint64_t paddr, offset;
   int max_outputs = MIN(ctx->num_outs, MAX_OUTPUTS);
   XvbmBufferHandle b_handle;
 
   (void)buf_idx; //unused param
   for (output_id = 0; output_id < max_outputs; output_id++) {
-    if (session->props.output[output_id].format == XMA_VCU_NV12_FMT_TYPE) {
+    if ((session->props.output[output_id].format == XMA_VCU_NV12_FMT_TYPE) || (session->props.output[output_id].format == XMA_VCU_NV12_10LE32_FMT_TYPE)){
       uint64_t offset = 0;
       do {
         b_handle = xvbm_buffer_pool_entry_alloc(ctx->out_phandle[output_id][0]);
         if (b_handle != NULL) {
           XVBM_BUFF_PR("\tMS: got free buffer from pool %p id = %d\n",
                        b_handle, xvbm_buffer_get_id(b_handle));
-          max_try = 0;
+          ctx->max_try[output_id] = 0;
           break;
         } else {
-          max_try++;
-          if (max_try >=100) {
+          ctx->max_try[output_id]++;
+          //extend pool by 1 at time for at max MAX_OUTPOOL_BUFFERS_RETRIES times
+          if (ctx->num_buffers_extended[output_id] < MAX_OUTPOOL_BUFFERS_RETRIES)
+          {
+            //Using another buffer handle from same pool to extend the buffer pool
+            for(int i = 0; i < MAX_OUTPOOL_BUFFERS; i++)
+            {
+              b_handle = ctx->out_bhandle[output_id][i][0];
+              if(b_handle)
+                break;
+            }
+            if(!b_handle)
+            {
+              ERROR_PRINT("Unable to find a buffer from bufferpool to extract pool handle");
+              return XMA_ERROR;
+            }
+            //Passing 0 to xvbm_buffer_pool_extend for getting the buffer count
+            uint32_t num = xvbm_buffer_pool_extend(b_handle,0);
+            DEBUG_PRINT("Scaler plg request to extend Scaler output pool(%d) by 1 buffers", num);
+            uint32_t cnt = xvbm_buffer_pool_extend(b_handle,1);
+            b_handle = NULL; //resetting b_handle
+            if (cnt != num+1) {
+              ERROR_PRINT("OOM: Scaler plg Failed to extend Scaler output pool by 1 buffers");
+              return XMA_ERROR;
+            }
+            else{
+              ctx->num_buffers_extended[output_id]++;
+              DEBUG_PRINT("New Scaler output pool has %d buffers", cnt);
+            }
+          }
+          if (ctx->max_try[output_id] >= MAX_RETRIES_PER_CHAN) {
             ERROR_PRINT ("xvbm_buffer_pool_entry_alloc failed forever\n");
             goto TRY_AGAIN;
           }
-          ERROR_PRINT ("Unable to get free buffer for encoder for channel id = %d, retrying..\n",
-                       output_id);
+          DEBUG_PRINT ("Unable to get free buffer for encoder for channel id = %d, retrying [try=%d]..\n",
+                          output_id, ctx->max_try[output_id]);
           usleep(2000);
         }
       } while (b_handle == NULL);
@@ -1212,17 +1207,17 @@ prepare_inout_buffers (XmaScalerSession *session, int32_t buf_idx)
       ctx->out_bhandle[output_id][ctx->s_idx][0] = b_handle;
       XVBM_BUFF_PR("MS adding buffer for output_id = %d, ctx->s_idx = %d\n", output_id,ctx->s_idx);
       paddr = xvbm_buffer_get_paddr(b_handle);
-      ctx->desc[output_id].dstImgBuf[0] = paddr;
-      
+      ctx->desc[ctx->pipe_idx][output_id].dstImgBuf[0] = paddr;
+
       if (output_id < (max_outputs-1)) //Since Input is cascaded  loop starts with 1
         /* prepare input register write at 'output_id+1' (in[1..7] = out[0..6]*/
-        ctx->desc[output_id+1].srcImgBuf[0] = paddr;
+        ctx->desc[ctx->pipe_idx][output_id+1].srcImgBuf[0] = paddr;
 
-      offset = ctx->out_stride[output_id] * ALIGN(ctx->out_height[output_id], VCU_HEIGHT_ALIGN);
+      offset = ctx->out_stride[output_id] * ctx->out_hgt_align[output_id];
       paddr += offset;
-      ctx->desc[output_id].dstImgBuf[1] = paddr;
+      ctx->desc[ctx->pipe_idx][output_id].dstImgBuf[1] = paddr;
       if (output_id < (max_outputs-1))
-        ctx->desc[output_id+1].srcImgBuf[1] = paddr;
+        ctx->desc[ctx->pipe_idx][output_id+1].srcImgBuf[1] = paddr;
     } else {
         for (plane_id = 0; plane_id < get_num_video_planes(session->props.output[output_id].format); plane_id++) {
           do {
@@ -1230,16 +1225,45 @@ prepare_inout_buffers (XmaScalerSession *session, int32_t buf_idx)
             if (b_handle != NULL) {
               XVBM_BUFF_PR("\tMS: got free buffer from pool %p id = %d\n",
                   b_handle, xvbm_buffer_get_id(b_handle));
-              max_try = 0;
+              ctx->max_try[output_id] = 0;
               break;
             } else {
-               max_try++;
-              if (max_try >=100) {
+              ctx->max_try[output_id]++;
+              //extend pool by 1 at time for at max MAX_OUTPOOL_BUFFERS_RETRIES times
+              if (ctx->num_buffers_extended[output_id] < MAX_OUTPOOL_BUFFERS_RETRIES)
+              {
+                //Using another buffer handle from same pool to extend the buffer pool
+                for(int i = 0; i < MAX_OUTPOOL_BUFFERS; i++)
+                {
+                  b_handle = ctx->out_bhandle[output_id][i][0];
+                  if(b_handle)
+                    break;
+                }
+                if(!b_handle)
+                {
+                  ERROR_PRINT("Unable to find a buffer from bufferpool to extract pool handle");
+                  return XMA_ERROR;
+                }
+                //Passing 0 to xvbm_buffer_pool_extend for getting the buffer count
+                uint32_t num = xvbm_buffer_pool_extend(b_handle,0);
+                DEBUG_PRINT("Scaler plg request to extend Scaler output pool(%d) by 1 buffers", num);
+                uint32_t cnt = xvbm_buffer_pool_extend(b_handle,1);
+                b_handle = NULL; //resetting b_handle
+                if (cnt != num+1) {
+                  ERROR_PRINT("OOM: Scaler plg Failed to extend Scaler output pool by 1 buffers");
+                  return XMA_ERROR;
+                }
+                else{
+                  ctx->num_buffers_extended[output_id]++;
+                  DEBUG_PRINT("New Scaler output pool has %d buffers", cnt);
+                }
+              }
+              if (ctx->max_try[output_id] >= MAX_RETRIES_PER_CHAN) {
                 ERROR_PRINT ("xvbm_buffer_pool_entry_alloc failed forever\n");
                 goto TRY_AGAIN;
               }
-              ERROR_PRINT ("Unable to get free buffer for encoder for channel id = %d, retrying..\n",
-                          output_id);
+              DEBUG_PRINT ("Unable to get free buffer for encoder for channel id = %d, retrying [try=%d]..\n",
+                              output_id, ctx->max_try[output_id]);
               usleep(2000);
             }
           } while (b_handle == NULL);
@@ -1250,11 +1274,11 @@ prepare_inout_buffers (XmaScalerSession *session, int32_t buf_idx)
            */
           ctx->out_bhandle[output_id][ctx->s_idx][plane_id] = b_handle;
           paddr = xvbm_buffer_get_paddr(b_handle);
-          ctx->desc[output_id].dstImgBuf[plane_id] = paddr;
+          ctx->desc[ctx->pipe_idx][output_id].dstImgBuf[plane_id] = paddr;
 
           if (output_id < (max_outputs-1))
             /* prepare input register write at 'output_id+1' */
-	    ctx->desc[output_id+1].srcImgBuf[plane_id] = paddr;
+            ctx->desc[ctx->pipe_idx][output_id+1].srcImgBuf[plane_id] = paddr;
         }//for (plane_id)
     } //if (session->props.output[output_id].format == XMA_VCU_NV12_FMT_TYPE)
   }// for (output_id
@@ -1283,7 +1307,8 @@ xlnx_multi_scaler_flush_frame (XmaScalerSession *session)
   int32_t ret=0;
 
   if ((ctx->recv_frame_cnt - ctx->sent_frame_cnt) > 1) {
-    xma_plg_schedule_work_item(xma_session, ctx->hw_reg, XV_MULTI_SCALER_CTRL_REGMAP_SIZE, &ret);
+    xma_plg_schedule_work_item(xma_session, ctx->hw_reg[ctx->pipe_idx], XV_MULTI_SCALER_CTRL_REGMAP_SIZE, &ret);
+    ctx->pipe_idx = (ctx->pipe_idx + 1) % MAX_PIPELINE_BUFFERS;
     return XMA_FLUSH_AGAIN;
   } else if ((ctx->recv_frame_cnt - ctx->sent_frame_cnt) == 1) {
     return XMA_FLUSH_AGAIN;
@@ -1316,6 +1341,14 @@ xlnx_multi_scaler_send_frame(XmaScalerSession *session, XmaFrame *frame)
     return xlnx_multi_scaler_flush_frame (session);
   }
 
+#ifdef HDR_DATA_SUPPORT
+  ctx->hdr_handle[ctx->s_idx] = xma_frame_get_side_data(frame, XMA_FRAME_HDR);
+  if(ctx->hdr_handle[ctx->s_idx]) {
+    xma_side_data_inc_ref(ctx->hdr_handle[ctx->s_idx]);
+    xma_frame_clear_all_side_data(frame);
+  }
+#endif
+
 #ifdef DUMP_INPUT_FRAMES
   {
     int written = fwrite (frame->data[0].buffer, 1, ctx->in_stride[0] * ctx->in_height[0], infp);
@@ -1340,17 +1373,20 @@ xlnx_multi_scaler_send_frame(XmaScalerSession *session, XmaFrame *frame)
     ctx->time_taken = (ctx->latency.tv_sec * 1e3) + (ctx->latency.tv_nsec / 1e6);
     syslog(LOG_DEBUG, "%s : %p : xma_scaler_frame_sent %lld : %lld\n", __func__, ctx, ctx->frame_sent, ctx->time_taken);
   }
-      
+
   if (ctx->first_frame == 0) {
     /* write input frame at index 0 */
     ret =  prep_and_write_input_buffer(session, buf_idx, frame);
-    ret |= prepare_inout_buffers(session, buf_idx);
+    if (ret != XMA_SUCCESS)
+      return ret;
+    ret = prepare_inout_buffers(session, buf_idx);
     if (ret != XMA_SUCCESS)
       return ret;
   } else {
-    if (ctx->enable_pipeline) {
+    if (ctx->enable_pipeline == 1) {
        /* schedule a request to XRT. This will execute for previous buffer */
-       XmaCUCmdObj cu_cmd = xma_plg_schedule_work_item(xma_session, ctx->hw_reg,XV_MULTI_SCALER_CTRL_REGMAP_SIZE, &xma_ret);
+       XmaCUCmdObj cu_cmd = xma_plg_schedule_work_item(xma_session, ctx->hw_reg[ctx->pipe_idx],XV_MULTI_SCALER_CTRL_REGMAP_SIZE, &xma_ret);
+       ctx->pipe_idx = (ctx->pipe_idx + 1) % MAX_PIPELINE_BUFFERS;
        (void)cu_cmd; //currently unused
        if (xma_ret != XMA_SUCCESS) {
          ERROR_PRINT ("failed schedule request to XRT...val = %d", xma_ret);
@@ -1359,27 +1395,30 @@ xlnx_multi_scaler_send_frame(XmaScalerSession *session, XmaFrame *frame)
      }
 
     /* prepare & write input buffer at channel-0 */
-    ret  = prep_and_write_input_buffer(session, buf_idx, frame);
+    ret = prep_and_write_input_buffer(session, buf_idx, frame);
+    if (ret != XMA_SUCCESS)
+      return ret;
     /* prepare input & output registers write at all channels except input channel-0 */
-    ret |= prepare_inout_buffers(session, buf_idx);
+    ret = prepare_inout_buffers(session, buf_idx);
     if (ret != XMA_SUCCESS)
       return ret;
   }
 
-  if (!ctx->enable_pipeline) {
-    XmaCUCmdObj cu_cmd  = xma_plg_schedule_work_item(xma_session, ctx->hw_reg, XV_MULTI_SCALER_CTRL_REGMAP_SIZE, &xma_ret);
+  if (ctx->enable_pipeline != 1) {
+    XmaCUCmdObj cu_cmd  = xma_plg_schedule_work_item(xma_session, ctx->hw_reg[ctx->pipe_idx], XV_MULTI_SCALER_CTRL_REGMAP_SIZE, &xma_ret);
+    ctx->pipe_idx = (ctx->pipe_idx + 1) % MAX_PIPELINE_BUFFERS;
     (void)cu_cmd; //currently unused
     if (xma_ret != XMA_SUCCESS) {
       ERROR_PRINT ("failed schedule request to XRT...val = %d", xma_ret);
       return xma_ret;
     }
   }
-  
+
   ctx->s_idx = (ctx->s_idx + 1) % MAX_OUTPOOL_BUFFERS;
   ctx->current_pipe = (ctx->current_pipe + 1) % MAX_OUTPOOL_BUFFERS;
 
   DEBUG_PRINT ("current pipe = %d", ctx->current_pipe);
-  if (ctx->enable_pipeline) {
+  if (ctx->enable_pipeline == 1) {
      if (ctx->first_frame < MAX_PIPELINE_BUFFERS) {
        ctx->first_frame++;
        /* needs more input frames to support pipelining */
@@ -1426,10 +1465,19 @@ xlnx_multi_scaler_recv_frame_list(XmaScalerSession *session, XmaFrame **frame_li
 #endif
   DEBUG_PRINT ("enter");
 
-  if (ctx->enable_pipeline) {
+  if (ctx->enable_pipeline == 1) {
      if (ctx->first_frame < MAX_PIPELINE_BUFFERS) {
-       xma_logmsg(XMA_WARNING_LOG, XMA_MULTISCALER, "Called receive frame before sending %d buffers and current buffered frames %d", 2, ctx->first_frame);
-       return XMA_SUCCESS;
+       xma_logmsg(XMA_ERROR, XMA_MULTISCALER, "Called receive frame before sending %d buffers and current buffered frames %d", 2, ctx->first_frame);
+
+       //Switch off the pipeline mode and fall back to single frame processing by scheduling the frame
+       XmaCUCmdObj cu_cmd = xma_plg_schedule_work_item(xma_session, ctx->hw_reg[ctx->pipe_idx],XV_MULTI_SCALER_CTRL_REGMAP_SIZE, &xma_ret);
+       ctx->pipe_idx = (ctx->pipe_idx + 1) % MAX_PIPELINE_BUFFERS;
+       if (xma_ret != XMA_SUCCESS) {
+         ERROR_PRINT ("failed schedule request to XRT...val = %d", xma_ret);
+         return XMA_ERROR;
+       }
+       ctx->enable_pipeline = 0;
+
      }
   }
 #ifdef MEASURE_TIME
@@ -1437,7 +1485,7 @@ xlnx_multi_scaler_recv_frame_list(XmaScalerSession *session, XmaFrame **frame_li
 #endif
 
   //Check if frame processing is complete (Check DONE bit)
-  xma_ret = xma_plg_is_work_item_done(xma_session, 1000);
+  xma_ret = xma_plg_is_work_item_done(xma_session, 5000);
   if (xma_ret != XMA_SUCCESS) {
     ERROR_PRINT ("Scaler Stopped responding");
     return xma_ret;
@@ -1462,10 +1510,12 @@ xlnx_multi_scaler_recv_frame_list(XmaScalerSession *session, XmaFrame **frame_li
     frame_list[output_id]->is_idr = ctx->is_idr[ctx->r_idx];
     frame_list[output_id]->time_base = ctx->time_base[ctx->r_idx];
     frame_list[output_id]->frame_rate = ctx->frame_rate[ctx->r_idx];
-
+    frame_list[output_id]->frame_props.linesize[0] = ctx->out_stride[output_id];
+    // linesize[1] set based on buffer type.
       int32_t plane_id = 0;
 
-      if (session->props.output[output_id].format == XMA_VCU_NV12_FMT_TYPE) {
+      if ((session->props.output[output_id].format == XMA_VCU_NV12_FMT_TYPE) ||
+         (session->props.output[output_id].format == XMA_VCU_NV12_10LE32_FMT_TYPE)){
           XvbmBufferHandle b_handle = ctx->out_bhandle[output_id][ctx->r_idx][plane_id];
           if (!b_handle) {
               ERROR_PRINT ("ERROR , no bhandle found\n");
@@ -1473,9 +1523,20 @@ xlnx_multi_scaler_recv_frame_list(XmaScalerSession *session, XmaFrame **frame_li
           }
 
           if (frame_list[output_id]->data[0].buffer_type == XMA_DEVICE_BUFFER_TYPE) {
+              /* Set linesize[1] to aligned height in zero copy use case so other modules
+              know where luma ends/chroma starts (since they are both in one buffer). */
+              frame_list[output_id]->frame_props.linesize[1] = ctx->out_hgt_align[output_id];
               frame_list[output_id]->data[plane_id].buffer = (void*)b_handle;
           } else {
-              uint32_t size = ALIGN(ctx->out_width[output_id], VCU_WIDTH_ALIGN) * ALIGN(ctx->out_height[output_id], VCU_HEIGHT_ALIGN);
+              frame_list[output_id]->frame_props.linesize[1] = frame_list[output_id]->frame_props.linesize[0];
+              uint32_t size;
+              if(session->props.output[output_id].format == XMA_VCU_NV12_10LE32_FMT_TYPE) {
+                size = (frame_list[output_id]->frame_props.linesize[0] *
+                       ctx->out_hgt_align[output_id]);
+              } else {
+                size = ALIGN(ctx->out_width[output_id], SCL_OUT_WIDTH_ALIGN) *
+                       ctx->out_hgt_align[output_id];
+              }
               uint8_t *hbuf;
               int32_t ret;
 
@@ -1485,14 +1546,14 @@ xlnx_multi_scaler_recv_frame_list(XmaScalerSession *session, XmaFrame **frame_li
                   return XMA_ERROR;
               }
 
-              ret  = xvbm_buffer_read(b_handle, hbuf, (size+size/2), 0);
+              ret = xvbm_buffer_read(b_handle, hbuf, (size + size / 2), 0);
               if (ret) {
                 ERROR_PRINT ("host buffer read failed\n");
                 return XMA_ERROR;
               }
 
               memcpy(frame_list[output_id]->data[0].buffer, hbuf,        size);
-              memcpy(frame_list[output_id]->data[1].buffer, (hbuf+size), size/2);
+              memcpy(frame_list[output_id]->data[1].buffer, (hbuf + size), size / 2);
               xvbm_buffer_pool_entry_free (ctx->out_bhandle[output_id][ctx->r_idx][plane_id]);
           }
 
@@ -1504,15 +1565,30 @@ xlnx_multi_scaler_recv_frame_list(XmaScalerSession *session, XmaFrame **frame_li
       } else {
         /* TODO: support something other than XMA_VCU_NV12_FMT_TYPE */
       }
+#ifdef HDR_DATA_SUPPORT
+      scaler_clear_hdr_side_data(frame_list[output_id]);
+      if(ctx->hdr_handle[ctx->r_idx]) {
+          xma_frame_add_side_data(frame_list[output_id], ctx->hdr_handle[ctx->r_idx]);
+          DEBUG_PRINT("Sending side data with scaler output frames \n");
+      }
+#endif
   }
-  
+
+#ifdef HDR_DATA_SUPPORT
+    /* Decrementing the side data ref count since the ref count is
+       incremented during alloc and side data addition */
+    if(ctx->hdr_handle[ctx->r_idx]) {
+        xma_side_data_dec_ref(ctx->hdr_handle[ctx->r_idx]);
+    }
+#endif
+
   ctx->sent_frame_cnt = ctx->sent_frame_cnt + 1;
   ctx->r_idx = (ctx->r_idx + 1) % MAX_OUTPOOL_BUFFERS;
 
   if (ctx->in_bhandle[buf_idx]) {
       XVBM_BUFF_PR("\tMS free input buffer =%p ID = %d\n",
                    ctx->in_bhandle[buf_idx],
-      xvbm_buffer_get_id(ctx->in_bhandle[buf_idx]));
+                   xvbm_buffer_get_id(ctx->in_bhandle[buf_idx]));
       xvbm_buffer_pool_entry_free(ctx->in_bhandle[buf_idx]);
   }
 
@@ -1525,7 +1601,7 @@ xlnx_multi_scaler_recv_frame_list(XmaScalerSession *session, XmaFrame **frame_li
     ctx->recv_func_time = ctx->recv_xrt_time = ctx->recv_count = 0;
   }
 #endif
-  DEBUG_PRINT ("leave");
+   DEBUG_PRINT ("leave");
   return XMA_SUCCESS;
 }
 
@@ -1537,7 +1613,7 @@ xlnx_multi_scaler_close(XmaScalerSession *session)
   XmaSession xma_session = session->base;
   MultiScalerContext *ctx = (MultiScalerContext*)session->base.plugin_data;
   int max_outputs = MIN(ctx->num_outs, MAX_OUTPUTS);
-  int plane_id, output_id;
+  int plane_id, output_id, pipe_id;
   DEBUG_PRINT ("enter");
 #ifdef DUMP_INPUT_FRAMES
   fclose (infp);
@@ -1551,7 +1627,9 @@ xlnx_multi_scaler_close(XmaScalerSession *session)
   for (output_id = 0; output_id < max_outputs; output_id++) {
     xma_plg_buffer_free(xma_session, ctx->HfltCoeff_Buffer[output_id]);
     xma_plg_buffer_free(xma_session, ctx->VfltCoeff_Buffer[output_id]);
-    xma_plg_buffer_free(xma_session, ctx->desc_buffer[output_id]);
+    for (pipe_id = 0; pipe_id < MAX_PIPELINE_BUFFERS; pipe_id++) {
+      xma_plg_buffer_free(xma_session, ctx->desc_buffer[pipe_id][output_id]);
+    }
     //@TODO add and use pool sharing API in xvbm
     if (!ctx->session_mix_rate) {
         for (plane_id = 0; plane_id < get_num_video_planes(session->props.output[output_id].format); plane_id++) {
@@ -1562,8 +1640,10 @@ xlnx_multi_scaler_close(XmaScalerSession *session)
     }
   }/* output_id */
 
-  if(ctx->desc)
-    free(ctx->desc);
+  for (pipe_id = 0; pipe_id < MAX_PIPELINE_BUFFERS; pipe_id++) {
+    if(ctx->desc[pipe_id])
+      free(ctx->desc[pipe_id]);
+  }
 
   DEBUG_PRINT ("leave");
   closelog();
