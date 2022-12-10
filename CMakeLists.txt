@@ -18,22 +18,44 @@ include (CMakeDependentOption)
 
 set(XMAMSCALER_PROJ "xilinx-u30-xma-multiscaler")
 set(XMAMSCALER_LIBNAME "xmultiscaler")
-set(XMAMSCALER_PROJ_VERSION "1.1.0")
+set(XMAMSCALER_PROJ_VERSION "1.1.1")
 
 find_program(UNAME_EXEC uname)
 find_program(LSB_RELEASE_EXEC lsb_release)
 
-# Grab Arch information like x86-64
-execute_process(COMMAND ${UNAME_EXEC} -p
-    OUTPUT_VARIABLE UNAME_ARCHTYPE
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND ${LSB_RELEASE_EXEC} -is
+    OUTPUT_VARIABLE LINUX_FLAVOR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if (${LINUX_FLAVOR} MATCHES "^(Ubuntu|Debian)")
+        # amd64
+        execute_process(
+        COMMAND dpkg --print-architecture
+        OUTPUT_VARIABLE CPACK_ARCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+elseif (${LINUX_FLAVOR} MATCHES "^(RedHat|CentOS|Amazon|Fedora|SUSE)")
+        # x86_64
+        execute_process(
+        COMMAND uname -m
+        OUTPUT_VARIABLE CPACK_ARCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+else()
+        message( SEND_ERROR "Trying to build on incompatible system \"${LINUX_FLAVOR}\"." )
+endif()
 
 # Grab OS release short name
 execute_process(COMMAND ${LSB_RELEASE_EXEC} -rs
-	OUTPUT_VARIABLE LSB_RELEASE_REL_SHORT
-	OUTPUT_STRIP_TRAILING_WHITESPACE)
+        OUTPUT_VARIABLE LSB_RELEASE_REL_SHORT
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-set(CPACK_PACKAGE_FILE_NAME "${XMAMSCALER_PROJ}_${XMAMSCALER_PROJ_VERSION}_${LSB_RELEASE_REL_SHORT}-${UNAME_ARCHTYPE}")
+if (${LINUX_FLAVOR} MATCHES "^Amazon")
+        set(LSB_RELEASE_REL_SHORT "amzn${LSB_RELEASE_REL_SHORT}")
+endif()
+
+set(CPACK_PACKAGE_FILE_NAME "${XMAMSCALER_PROJ}_${XMAMSCALER_PROJ_VERSION}_${LSB_RELEASE_REL_SHORT}-${CPACK_ARCH}")
 set(CPACK_PACKAGE_VERSION ${XMAMSCALER_PROJ_VERSION})
 project(${XMAMSCALER_PROJ})
 
@@ -42,7 +64,7 @@ set(ENV{PKG_CONFIG_PATH} "$ENV{PKG_CONFIG_PATH}:/usr/lib/pkgconfig")
 # Linking variables
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XRT REQUIRED	xrt)
-pkg_check_modules(XMA REQUIRED libxmaapi)
+pkg_check_modules(XMA REQUIRED libxma2api)
 pkg_check_modules(XVBM REQUIRED xvbm)
 pkg_check_modules(THREADS required)
 
@@ -71,6 +93,8 @@ add_library(${XMAMSCALER_LIBNAME} SHARED
 #set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS	"${CMAKE_CXX_FLAGS} -std=c++11 -Wall -Wextra -DDSA64 -fpermissive")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_FILE_LICENSE_PATH "/usr/share/doc/xilinx/u30")
 
 if (ENABLE_PIPELINE)
   set(CMAKE_CXX_FLAGS	"${CMAKE_CXX_FLAGS} -DNO_PIPELINE")
@@ -98,6 +122,7 @@ set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${XVBM_LDFLAGS} ${X
 
 # Set the location for library installation
 install(TARGETS ${XMAMSCALER_LIBNAME} DESTINATION ${CMAKE_INSTALL_PREFIX}/xma_plugins)
+install(FILES ${CPACK_RESOURCE_FILE_LICENSE} CONFIGURATIONS Release RUNTIME DESTINATION ${CPACK_FILE_LICENSE_PATH}/${XMAMSCALER_PROJ})
 
 # Packaging section
 set(CPACK_PACKAGE_CONTACT "Rohit Athavale <rohit.athavale@xilinx.com>")
@@ -107,7 +132,7 @@ set(CPACK_PACKAGE_DESCRIPTION "The Xilinx MPSoC based Scaler Plugin controls
                                the accelerated FPGA scaler kernel used to perform
                                scaling of video. Up to 5 output resolutions can be
                                generated from a single input")
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "xrt (>= 2.11), xilinx-xvbm (>= 1.0.2) ")
-set(CPACK_RPM_PACKAGE_DEPENDS "xrt (>= 2.11), xilinx-xvbm (>= 1.0.2) ")
-set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION "/opt" "/opt/xilinx" "/usr/lib" "/usr/lib/pkgconfig")
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "xrt (>= 2.11), xilinx-xvbm (>= 1.0.2)")
+set(CPACK_RPM_PACKAGE_REQUIRES "xrt >= 2.11, xilinx-xvbm >= 1.0.2")
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION "/opt" "/opt/xilinx" "/usr/lib" "/usr/lib/pkgconfig" "/usr/share/doc/xilinx" "/usr/share/doc/xilinx/u30")
 include(CPack)
